@@ -57,5 +57,48 @@ so what we do is we pull funds from wethStrategyVault.... by swapping it back to
 
 
 
+## Direct Settlement Flow (Hook + PoolManager)
+
+The current implementation keeps Uniswap v4’s accounting loop in charge while still sourcing the *actual* liquidity from Aave via our vault strategies. The high-level flow for a large `USDC -> WETH` swap looks like this:
+
+```
+User               SwapRouter           PoolManager           CoWHook           AaveStrategy (USDC/WETH)
+ |   swap 2k USDC     |                     |                    |                        |
+ |------------------->|                     |                    |                        |
+ |                    | unlock + call swap  |                    |                        |
+ |                    |-------------------->| beforeSwap delta   |                        |
+ |                    |                     |-----><- (specified +2000 USDC, unspecified -WETH*)
+ |                    |                     |                    |                        |
+ |                    |                     |        pullFundsForSwap ---> withdraw WETH ----> Aave
+ |                    |                     |                    |<-------------------------|
+ |                    |                     |                    | (hold WETH, record swap)
+ |                    |                     |  _swap executes    |                        |
+ |                    |                     |<-------------------|                        |
+ |                    |                     | afterSwap          | take USDC + settle WETH |
+ |                    |                     |<-------------------|----> poolManager.sync() |
+ |                    |                     |                    |----> poolManager.settle |
+ |                    |                     |  swapDelta cleared |                        |
+ |                    | take WETH ----------|                    |                        |
+ |<-------------------|                     |                    |                        |
+```
+`*` the hook returns a before-swap delta where it is owed the user’s USDC (positive specified delta) and owes the pool the WETH it will source from Aave (negative unspecified delta).
+
+### Why we **must** call `take` and `settle`
+
+- **Pool accounting is authoritative.** Every swap accrues deltas against the caller and the hook. Until those deltas net to zero, `PoolManager.unlock` reverts with `CurrencyNotSettled`. Our hook is promising to repay the pool in both denominations, so it must do so explicitly.
+- **`poolManager.take(currencyIn, ...)`** repays the USDC the pool fronted to the router. Once the hook has that USDC, it redistributes it: deposit back into the USDC strategy and forward the fee to governance.
+- **`poolManager.sync/settle(currencyOut)`** supplies the WETH we promised. We source it from `AaveStrategy::pullFundsForSwap`, then push it into the pool manager so the router has reserves to deliver to the user.
+
+Because we settle both sides, LP reserves end up exactly where they started. The price, tick, and pool fees remain untouched—Uniswap is still clearing the swap, we simply reimburse the pool using our own liquidity.
+
+### Resulting invariants
+
+- **User gets WETH** supplied by the strategy, routed through the pool like any other swap.
+- **Strategies update balances** (USDC leaves Aave, WETH re-enters Aave) so vault shares remain accurate.
+- **Pool price is unchanged** because we neutralize the deltas right after `_swap`.
+- **Governance fee** is carved out before re-supplying USDC, ensuring vault yield share.
+
+This pattern lets us keep the COW hook logic fully compatible with Uniswap v4 while still extracting and recycling strategy liquidity around each qualifying order.
+
 
 

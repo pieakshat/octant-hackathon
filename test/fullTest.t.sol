@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {Test} from "forge-std/Test.sol";
+import {console} from "forge-std/console.sol";
 import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
@@ -310,6 +311,14 @@ contract TestCoWHook is Test, Deployers {
         uint256 governanceUsdcBefore = IERC20(USDC).balanceOf(hook.GOVERNANCE());
         uint256 userWethBefore = IERC20(WETH).balanceOf(user);
 
+        console.log("--- Pre Swap Snapshot ---");
+        console.logAddress(user);
+        console.log("amountIn (USDC)", amountIn);
+        console.log("usdcStrategyAssetsBefore", usdcStrategyAssetsBefore);
+        console.log("wethStrategyAssetsBefore", wethStrategyAssetsBefore);
+        console.log("governanceUsdcBefore", governanceUsdcBefore);
+        console.log("userWethBefore", userWethBefore);
+
         vm.prank(address(swapRouterNoChecks));
         IERC20(USDC).forceApprove(address(hook), type(uint256).max);
 
@@ -330,8 +339,22 @@ contract TestCoWHook is Test, Deployers {
         uint256 wethStrategyAssetsAfter = wethStrategy.totalManagedAssets();
         uint256 governanceUsdcAfter = IERC20(USDC).balanceOf(hook.GOVERNANCE());
 
+        console.log("--- Post Swap Snapshot ---");
+        console.log("usdcStrategyAssetsAfter", usdcStrategyAssetsAfter);
+        console.log("wethStrategyAssetsAfter", wethStrategyAssetsAfter);
+        console.log("governanceUsdcAfter", governanceUsdcAfter);
+        console.log("userWethAfter", userWethAfter);
+
         uint256 expectedFee = (amountIn * 50) / 10_000;
         uint256 expectedDeposit = amountIn - expectedFee;
+
+        console.log("--- Derived Values ---");
+        console.log("expectedFee", expectedFee);
+        console.log("expectedDeposit", expectedDeposit);
+        console.log("actualStrategyDepositDelta", usdcStrategyAssetsAfter - usdcStrategyAssetsBefore);
+        console.log("actualStrategyWithdrawDelta", wethStrategyAssetsBefore - wethStrategyAssetsAfter);
+        console.log("actualGovernanceFeeDelta", governanceUsdcAfter - governanceUsdcBefore);
+        console.log("netUserWethGain", userWethAfter - userWethBefore);
 
         assertGt(userWethAfter, userWethBefore, "User should receive WETH from strategy liquidity");
         assertApproxEqAbs(
