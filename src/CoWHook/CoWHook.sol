@@ -28,6 +28,8 @@ interface IAaveLiquidityStrategy {
     function pullFundsForSwap(uint256 amount, uint256 maxLossBps) external returns (uint256);
 
     function pushAfterSwap(uint256 amount) external returns (uint256);
+
+    function totalManagedAssets() external view returns (uint256);
 }
 
 struct DirectSwapContext {
@@ -63,6 +65,23 @@ contract CoWHook is BaseHook {
 
     constructor(IPoolManager _manager) BaseHook(_manager) {
         GOVERNANCE = msg.sender;
+    }
+
+    function getTotalManagedAssets(address tokenA, address tokenB)
+        external
+        view
+        returns (uint256 tokenAAssets, uint256 tokenBAssets)
+    {
+        IAaveLiquidityStrategy strategyA = strategies[tokenA];
+        IAaveLiquidityStrategy strategyB = strategies[tokenB];
+
+        if (address(strategyA) != address(0)) {
+            tokenAAssets = strategyA.totalManagedAssets();
+        }
+
+        if (address(strategyB) != address(0)) {
+            tokenBAssets = strategyB.totalManagedAssets();
+        }
     }
 
     modifier onlyGovernance() {
@@ -185,7 +204,7 @@ contract CoWHook is BaseHook {
         }
 
         if (fee > 0) {
-            IERC20(ctx.currencyIn).safeTransfer(GOVERNANCE, fee);
+            IERC20(ctx.currencyIn).safeTransfer(GOVERNANCE, fee); // Fee goes to the governance contracts
             emit FeeCollected(ctx.currencyIn, fee);
         }
 
