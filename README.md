@@ -1,104 +1,86 @@
-### Here's what I have to build 
+## Yield MM
 
-we use octant v2 Vault to take user deposits 
+Yield MM is a market-making strategy designed for users who want both lending yield and swap fees without manually managing liquidity. The system is built on:
 
-we are only doing it for WETH/USDC pairs on ethereum mainnet 
+- **Octant v2 multistrategy vaults** (one vault per asset),
+- **Aave** for base yield, and
+- **A Uniswap v4 CoW hook** that only provides liquidity when a large order arrives.
 
-user deposits either of the token on out vaults
+The current deployment targets the WETH/USDC pair on Ethereum mainnet, but the flow generalises to any pair the vault system supports.
 
-our vaults move those assets to aave to earn yields 
+### Core Flow
 
-we are building a COW hook on uniswap-v4 
-
-whenever an order is placed on our hook 
-
-we do some computations/analysis (xyz) to see if its a suitable swap 
-
-if yes 
-    we pull the funds from aave --> provide liquidity for the swap with fee --> fee goes back to the vault --> the swapped asset comes back to aave
-
-if no 
-    we do nothing 
-
-
-## Contract architecture 
-
-for every hook that we build on a particular pool 
-
-there will be two strategy vaults(one vault per asset)....
-
-here's an example (fulll flow)
-
-lets say we are a hook on WETH/UDC pair 
-
-users can come and deposit on either of the strategy vaults they get their respective pool share tokens 
-these two strategyVaults don't have to maintain any ratio necessarily.... 
-
-lets say there are 1000USDC and 2 weth in the strategyVaults respectively 
-
-an order comes on our hook for 1000 usdc swap 
-
-we detect it call pull 100 usdc from aave in our usdcStrategyContract onBehalfOf cof CoWHook 
-
-hook completes the swap and we get weth in return(assume 1000usdc = 1 weth)
-
-weth is then supplied back to aave from the hook contract only onBehalfOf WETH strategy vault address
-
-new state 
-usdcStrategyVault = 0usdc 
-wethStrategyVault = 3 weth 
-
-now les say a user comes to take out their 100 usdc that they deposited 
-but usdcStrategyVault has 0 usdc 
-
-so what we do is we pull funds from wethStrategyVault.... by swapping it back to usdc and sending funds to the user
-
-
-
-
-
-## Direct Settlement Flow (Hook + PoolManager)
-
-The current implementation keeps Uniswap v4’s accounting loop in charge while still sourcing the *actual* liquidity from Aave via our vault strategies. The high-level flow for a large `USDC -> WETH` swap looks like this:
+1. **Deposit** – Users supply USDC or WETH into the corresponding vault and receive ERC4626-style shares. Vaults route capital into Aave strategies for passive yield.
+2. **CoW evaluation** – When Uniswap sees a large swap, the hook validates the order (size, token support, vault liquidity).
+3. **Liquidity sourcing** – The hook instructs the out-strategy to withdraw just enough tokens from Aave (`pullFundsForSwap`). Idle balances avoid price impact.
+4. **Filling the order** – The hook sends the requested asset to the trader, receives the counter-asset, charges a 50 bps fee, and deposits the net amount into the paired strategy.
+5. **Settlement** – To preserve Uniswap pool invariants, the hook calls `poolManager.take` (repay input token) and `poolManager.sync/settle` (deliver output token). LP reserves and price remain unchanged; only vault balances move.
+6. **Redeem** – When a depositor withdraws, vaults either return idle assets or use `ExactOutputSwapRouter` to swap the paired asset back, guaranteeing fast redemptions.
 
 ```
-User               SwapRouter           PoolManager           CoWHook           AaveStrategy (USDC/WETH)
- |   swap 2k USDC     |                     |                    |                        |
- |------------------->|                     |                    |                        |
- |                    | unlock + call swap  |                    |                        |
- |                    |-------------------->| beforeSwap delta   |                        |
- |                    |                     |-----><- (specified +2000 USDC, unspecified -WETH*)
- |                    |                     |                    |                        |
- |                    |                     |        pullFundsForSwap ---> withdraw WETH ----> Aave
- |                    |                     |                    |<-------------------------|
- |                    |                     |                    | (hold WETH, record swap)
- |                    |                     |  _swap executes    |                        |
- |                    |                     |<-------------------|                        |
- |                    |                     | afterSwap          | take USDC + settle WETH |
- |                    |                     |<-------------------|----> poolManager.sync() |
- |                    |                     |                    |----> poolManager.settle |
- |                    |                     |  swapDelta cleared |                        |
- |                    | take WETH ----------|                    |                        |
- |<-------------------|                     |                    |                        |
+User               SwapRouter           PoolManager             CoWHook            Strategies (Aave)
+ | swap X for Y        |                      |                       |                        |
+ |-------------------->| unlock + swap        |---------------------->| beforeSwap check       |
+ |                     |                      |                       | withdraw liquidity ----+
+ |                     |                      |                       |<--- from paired strategy
+ |                     |                      |                       | afterSwap settle        |
+ |<--------------------| receive output       |<----------------------| take/sync + redeposit   |
 ```
-`*` the hook returns a before-swap delta where it is owed the user’s USDC (positive specified delta) and owes the pool the WETH it will source from Aave (negative unspecified delta).
 
-### Why we **must** call `take` and `settle`
+### Design Considerations
 
-- **Pool accounting is authoritative.** Every swap accrues deltas against the caller and the hook. Until those deltas net to zero, `PoolManager.unlock` reverts with `CurrencyNotSettled`. Our hook is promising to repay the pool in both denominations, so it must do so explicitly.
-- **`poolManager.take(currencyIn, ...)`** repays the USDC the pool fronted to the router. Once the hook has that USDC, it redistributes it: deposit back into the USDC strategy and forward the fee to governance.
-- **`poolManager.sync/settle(currencyOut)`** supplies the WETH we promised. We source it from `AaveStrategy::pullFundsForSwap`, then push it into the pool manager so the router has reserves to deliver to the user.
+- **Composability first** – The CoW hook, Octant vaults, and Aave strategies were implemented independently, then stitched together with integration tests (hook ↔ vault ↔ user ↔ vault).
+- **Paired vault coordination** – Each asset has its own vault, but they operate as a pair. If USDC is depleted after a large swap, the WETH vault can swap back to USDC before honouring redemptions.
+- **Withdrawal guarantees** – Early prototypes assumed idle USDC was sufficient. After feedback, an exact-output router was introduced so the WETH strategy can repurchase USDC deterministically before releasing funds to users.
 
-Because we settle both sides, LP reserves end up exactly where they started. The price, tick, and pool fees remain untouched—Uniswap is still clearing the swap, we simply reimburse the pool using our own liquidity.
+Yield MM lets any depositor act like a professional market maker: capital earns Aave yield by default, steps in only when Uniswap needs large liquidity, and captures fees without harmful price impact.
 
-### Resulting invariants
+## Repository Layout
 
-- **User gets WETH** supplied by the strategy, routed through the pool like any other swap.
-- **Strategies update balances** (USDC leaves Aave, WETH re-enters Aave) so vault shares remain accurate.
-- **Pool price is unchanged** because we neutralize the deltas right after `_swap`.
-- **Governance fee** is carved out before re-supplying USDC, ensuring vault yield share.
+- `src/`
+  - `CoWHook/CoWHook.sol` – Uniswap v4 hook that orchestrates CoW fills, strategy withdrawals, fee accounting, and pool settlement.
+  - `CoWHook/interfaces/IAaveStrategy.sol` – minimal interface used by the hook to interact with strategy contracts.
+  - `strategies/AaveStrategy.sol` – Octant strategy wrapper responsible for supplying/withdrawing against Aave and coordinating with partner strategies.
+  - `routers/ExactOutputSwapRouter.sol` – helper router used during withdrawals to source the paired asset with an exact-output swap.
+  - `interfaces/IExactOutputSwapRouter.sol` – interface for the router above.
+- `test/`
+  - `fullTest.t.sol` – original integration tests covering deposits, swaps, and rebalancing behaviour.
+  - `EndToEnd.t.sol` – full mainnet-fork scenario that deposits users, runs a solver swap, and redeems shares through the entire pipeline.
+- `foundry.toml` – Foundry configuration.
 
-This pattern lets us keep the COW hook logic fully compatible with Uniswap v4 while still extracting and recycling strategy liquidity around each qualifying order.
+## Contracts Topology
+
+```
+                         +---------------------+
+                         |        Users        |
+                         +---------------------+
+                           /               \
+                          /                 \
+                         v                   v
+            +---------------------+   +---------------------+
+            |  USDC Vault (ovUSDC)|   |  WETH Vault (ovWETH)|
+            +---------------------+   +---------------------+
+                      |                           |
+                      v                           v
+          +---------------------+     +----------------------+
+          |  AaveStrategy USDC  |<--->|  AaveStrategy WETH   |
+          +---------------------+     +----------------------+
+                      \                           /
+                       \                         /
+                        v                       v
+                         +---------------------+
+                         |       CoW Hook      |
+                         +---------------------+
+                                       |
+                                       v
+                         +-----------------------------+
+                         |   Uniswap v4 Pool Manager   |
+                         +-----------------------------+
+```
+
+- Users deposit USDC/WETH into the relevant multistrategy vault.
+- Vaults forward liquidity to their Aave strategies, which coordinate via the paired strategy link.
+- When a swap hits the pool, the CoW hook decides whether it qualifies as “large”, pulls liquidity from the appropriate strategy, and settles everything back through the Uniswap v4 pool manager. 
 
 
 

@@ -20,18 +20,7 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {FullMath} from "v4-core/libraries/FullMath.sol";
-
-interface IAaveLiquidityStrategy {
-    function assetToken() external view returns (address);
-
-    function getAvailableLiquidityForSwap() external view returns (uint256);
-
-    function pullFundsForSwap(uint256 amount, uint256 maxLossBps) external returns (uint256);
-
-    function pushAfterSwap(uint256 amount) external returns (uint256);
-
-    function totalManagedAssets() external view returns (uint256);
-}
+import {IAaveStrategy} from "../interfaces/IAaveStrategy.sol";
 
 struct DirectSwapContext {
     bool isExactInput;
@@ -46,15 +35,15 @@ contract CoWHook is BaseHook {
     using SafeCast for uint256;
     using SafeCast for int256;
 
-struct PendingSwap {
-    address strategyIn;
-    address currencyIn;
-    address currencyOut;
-    uint256 depositAmount;
-    uint256 feeAmount;
-    uint256 totalInputAmount;
-    uint256 amountOut;
-}
+    struct PendingSwap {
+        address strategyIn;
+        address currencyIn;
+        address currencyOut;
+        uint256 depositAmount;
+        uint256 feeAmount;
+        uint256 totalInputAmount;
+        uint256 amountOut;
+    }
 
     error StrategyNotConfigured();
     error InvalidStrategyAddress();
@@ -71,23 +60,28 @@ struct PendingSwap {
 
     address public immutable GOVERNANCE;
 
-    mapping(address => IAaveLiquidityStrategy) public strategies;
+    mapping(address => IAaveStrategy) public strategies;
     mapping(bytes32 => PendingSwap) private pendingSwaps;
 
     event StrategyConfigured(address indexed token, address indexed strategy);
     event FeeCollected(address indexed token, uint256 amount);
 
     constructor(IPoolManager _manager) BaseHook(_manager) {
-        GOVERNANCE = msg.sender;
+        GOVERNANCE = msg.sender;    // address that will receive the fees collected from Market making 
     }
 
+    /// @notice Get the total managed assets for the two tokens of the pair
+    /// @param tokenA The address of the first token of the pair
+    /// @param tokenB The address of the second token of the pair
+    /// @return tokenAAssets The total managed assets for the first token of the pair
+    /// @return tokenBAssets The total managed assets for the second token of the pair
     function getTotalManagedAssets(address tokenA, address tokenB)
         external
         view
         returns (uint256 tokenAAssets, uint256 tokenBAssets)
     {
-        IAaveLiquidityStrategy strategyA = strategies[tokenA];
-        IAaveLiquidityStrategy strategyB = strategies[tokenB];
+        IAaveStrategy strategyA = strategies[tokenA];
+        IAaveStrategy strategyB = strategies[tokenB];
 
         if (address(strategyA) != address(0)) {
             tokenAAssets = strategyA.totalManagedAssets();
@@ -98,15 +92,20 @@ struct PendingSwap {
         }
     }
 
+    /// @notice Modifier to only allow the governance address to call the function
     modifier onlyGovernance() {
         _enforceGovernance();
         _;
     }
 
+    /// @notice Enforce that the caller is the governance address
     function _enforceGovernance() internal view {
         if (msg.sender != GOVERNANCE) revert NotGovernance();
     }
 
+    /// @notice Set the strategy via the governance address for a given token 
+    /// @param token The address of the token to set the strategy for
+    /// @param strategyAddress The address of the strategy to set for the token
     function setStrategyForToken(address token, address strategyAddress) external onlyGovernance {
         if (token == address(0)) revert InvalidStrategyAddress();
 
@@ -116,13 +115,15 @@ struct PendingSwap {
             return;
         }
 
-        IAaveLiquidityStrategy strategyInstance = IAaveLiquidityStrategy(strategyAddress);
+        IAaveStrategy strategyInstance = IAaveStrategy(strategyAddress);
         if (strategyInstance.assetToken() != token) revert StrategyAssetMismatch();
 
         strategies[token] = strategyInstance;
         emit StrategyConfigured(token, strategyAddress);
     }
 
+    /// @notice Get the permissions for the hook
+    /// @return Permissions The permissions for the hook
     function getHookPermissions() 
     public pure override 
     returns (Hooks.Permissions memory) {
@@ -144,7 +145,11 @@ struct PendingSwap {
             });
     }
 
-    function _beforeSwap(
+    /// @notice Before swap hook, handles the logic for how to execute the swap 
+    /// @param sender The address of the sender
+    /// @param key The key of the pool
+    /// @param params The parameters of the swap
+        function _beforeSwap(
         address sender, 
         PoolKey calldata key, 
         SwapParams calldata params, 
@@ -178,6 +183,14 @@ struct PendingSwap {
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
+    /// @notice Execute the direct swap between user and the strategyVault
+    /// @param sender The address of the sender
+    /// @param key The key of the pool
+    /// @param params The parameters of the swap
+    /// @param ctx The context of the swap
+    /// @return selector The selector of the hook
+    /// @return delta The delta of the swap
+    /// @return hookFee The hook fee of the swap
     function executeDirectSwap(
         address sender,
         PoolKey calldata key,
@@ -189,9 +202,12 @@ struct PendingSwap {
     {
         if (ctx.currencyIn == ctx.currencyOut) revert UnsupportedSwapDirection();
 
-        IAaveLiquidityStrategy outStrategy = strategies[ctx.currencyOut];
-        IAaveLiquidityStrategy inStrategy = strategies[ctx.currencyIn];
+        IAaveStrategy outStrategy = strategies[ctx.currencyOut];
+        IAaveStrategy inStrategy = strategies[ctx.currencyIn];
 
+
+        // The txn will directly revert instead of going through pool if it fails in executeDirectSwap
+        // this is done intentionally so that the user swapping the large amount doesn't go through the pool unexpectedly
         if (address(outStrategy) == address(0) || address(inStrategy) == address(0)) {
             revert StrategyNotConfigured();
         }
@@ -235,6 +251,11 @@ struct PendingSwap {
         return _buildDelta(ctx);
     }
 
+    /// @notice Compute the swap key
+    /// @param sender The address of the sender
+    /// @param key The key of the pool
+    /// @param params The parameters of the swap
+    /// @return swapKey The key of the swap
     function _computeSwapKey(address sender, PoolKey calldata key, SwapParams calldata params)
         internal
         pure
@@ -255,7 +276,11 @@ struct PendingSwap {
         );
     }
 
-    function _depositIntoStrategy(IAaveLiquidityStrategy strategyRef, address token, uint256 amount) internal {
+    /// @notice Deposit into the strategyVault called after direct swap
+    /// @param strategyRef The address of the strategy
+    /// @param token The address of the token to deposit
+    /// @param amount The amount of the token to deposit
+    function _depositIntoStrategy(IAaveStrategy strategyRef, address token, uint256 amount) internal {
         if (amount == 0) {
             return;
         }
@@ -268,21 +293,26 @@ struct PendingSwap {
         return (amount * HOOK_FEE_BPS) / MAX_BPS;
     }
 
+
     function _buildDelta(DirectSwapContext memory ctx)
         internal
         pure
         returns (bytes4, BeforeSwapDelta, uint24)
     {
-        if (!ctx.isExactInput) {
-            revert UnsupportedSwapDirection();
-        }
-
         if (ctx.amountIn > uint256(type(uint256).max) || ctx.amountOut > uint256(type(uint256).max)) {
             revert SwapAmountTooLarge();
         }
 
-        int128 deltaSpecified = int256(ctx.amountIn).toInt128();
-        int128 deltaUnspecified = -int256(ctx.amountOut).toInt128();
+        int128 deltaSpecified;
+        int128 deltaUnspecified;
+
+        if (ctx.isExactInput) {
+            deltaSpecified = int256(ctx.amountIn).toInt128();
+            deltaUnspecified = -int256(ctx.amountOut).toInt128();
+        } else {
+            deltaSpecified = -int256(ctx.amountOut).toInt128();
+            deltaUnspecified = int256(ctx.amountIn).toInt128();
+        }
 
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(deltaSpecified, deltaUnspecified), 0);
     }
@@ -324,6 +354,7 @@ struct PendingSwap {
         }
     }
 
+
     function _afterSwap(
         address sender,
         PoolKey calldata key,
@@ -346,7 +377,7 @@ struct PendingSwap {
 
             if (pending.depositAmount > 0) {
                 IERC20(pending.currencyIn).safeTransfer(pending.strategyIn, pending.depositAmount);
-                IAaveLiquidityStrategy(pending.strategyIn).pushAfterSwap(pending.depositAmount);
+                IAaveStrategy(pending.strategyIn).pushAfterSwap(pending.depositAmount);
             }
 
             if (pending.feeAmount > 0) {

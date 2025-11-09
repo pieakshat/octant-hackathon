@@ -366,4 +366,101 @@ contract TestCoWHook is Test, Deployers {
         assertLt(wethStrategyAssetsAfter, wethStrategyAssetsBefore, "WETH strategy should have reduced assets");
         assertEq(governanceUsdcAfter - governanceUsdcBefore, expectedFee, "Governance should collect swap fee");
     }
+
+    function testFullLifecycleDepositSwapAndRedeem() public {
+        address depositor = makeAddr("usdc-depositor");
+        uint256 depositAmount = 500_000 * 1e6;
+        uint256 initialPairWeth = 1_500 * 1e18;
+
+        // 1) User deposits USDC into the vault and receives ovUSDC shares.
+        deal(USDC, depositor, depositAmount);
+        vm.startPrank(depositor);
+        IERC20(USDC).forceApprove(address(usdcVault), depositAmount);
+        uint256 userShares = usdcVault.deposit(depositAmount, depositor);
+        vm.stopPrank();
+
+        console.log("--- Initial Deposit ---");
+        console.logAddress(depositor);
+        console.log("depositAmount", depositAmount);
+        console.log("userShares", userShares);
+        console.log("usdcVault.totalAssets()", usdcVault.totalAssets());
+
+        // 2) Supply WETH liquidity for the paired strategy so it can backstop future withdrawals.
+        // this is for test purposes only
+        _provideWethForPairStrategy(initialPairWeth);
+
+        // 3) A solver executes a large CoW order (USDC -> WETH) against the hook.
+        //    Internally this routes through Uniswap V4, triggering CoWHook.executeDirectSwap(),
+        //    which sources WETH from the WETH strategy and returns USDC to the hook for redeposit.
+        address largeSwapper = makeAddr("large-swapper-2");
+        uint256 largeAmount = 2_000 * 1e6;
+        _performUsdcToWethSwap(largeSwapper, largeAmount);
+
+        uint256 usdcStrategyAssetsAfterSwap = usdcStrategy.totalManagedAssets();
+        uint256 wethStrategyAssetsAfterSwap = wethStrategy.totalManagedAssets();
+
+        console.log("--- After Large USDC->WETH Swap ---");
+        console.log("usdcStrategy.totalManagedAssets()", usdcStrategyAssetsAfterSwap);
+        console.log("wethStrategy.totalManagedAssets()", wethStrategyAssetsAfterSwap);
+        console.log("usdcStrategy idle balance", IERC20(USDC).balanceOf(address(usdcStrategy)));
+        console.log("usdcStrategy aToken balance", IERC20(aTokenUsdc).balanceOf(address(usdcStrategy)));
+
+        // Depositor wants to exit fully
+        // 4) Original depositor asks to redeem all their shares. CoWHook/AaveStrategy will sell WETH
+        //    back to USDC via ExactOutputSwapRouter and pair-strategy bridge, if required.
+        uint256 usdcBalanceBeforeWithdraw = IERC20(USDC).balanceOf(depositor);
+        uint256 usdcStrategyIdleBefore = IERC20(USDC).balanceOf(address(usdcStrategy));
+        uint256 usdcStrategyATokenBefore = IERC20(aTokenUsdc).balanceOf(address(usdcStrategy));
+
+        console.log("--- Before Withdrawal ---");
+        console.log("depositor USDC balance", usdcBalanceBeforeWithdraw);
+        console.log("usdcStrategy idle", usdcStrategyIdleBefore);
+        console.log("usdcStrategy aToken", usdcStrategyATokenBefore);
+
+        vm.startPrank(depositor);
+        address[] memory emptyQueue = new address[](0);
+        usdcVault.redeem(userShares, depositor, depositor, 10_000, emptyQueue);
+        vm.stopPrank();
+
+        uint256 usdcBalanceAfterWithdraw = IERC20(USDC).balanceOf(depositor);
+        uint256 usdcStrategyIdleAfter = IERC20(USDC).balanceOf(address(usdcStrategy));
+        uint256 usdcStrategyATokenAfter = IERC20(aTokenUsdc).balanceOf(address(usdcStrategy));
+        uint256 wethStrategyAssetsFinal = wethStrategy.totalManagedAssets();
+
+        console.log("--- After Withdrawal ---");
+        console.log("depositor USDC balance", usdcBalanceAfterWithdraw);
+        console.log("usdcStrategy idle", usdcStrategyIdleAfter);
+        console.log("usdcStrategy aToken", usdcStrategyATokenAfter);
+        console.log("wethStrategy.totalManagedAssets()", wethStrategyAssetsFinal);
+        console.log("usdcVault.totalAssets()", usdcVault.totalAssets());
+
+        assertApproxEqAbs(
+            usdcBalanceAfterWithdraw - usdcBalanceBeforeWithdraw,
+            depositAmount,
+            1e4,
+            "Depositor should receive original USDC"
+        );
+        assertEq(usdcVault.balanceOf(depositor), 0, "Depositor shares should burn");
+    }
+
+    function _performUsdcToWethSwap(address swapper, uint256 amountIn) internal {
+        // Simulate the CoW solver paying from the user wallet into the router.
+        deal(USDC, swapper, amountIn);
+        vm.startPrank(swapper);
+        IERC20(USDC).forceApprove(address(swapRouterNoChecks), amountIn);
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: -int256(amountIn),
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        swapRouterNoChecks.swap(key, params);
+        vm.stopPrank();
+    }
+
+    function _provideWethForPairStrategy(uint256 amount) internal {
+        // Seed the paired WETH strategy so it can supply WETH when USDC liquidity needs to be repurchased.
+        deal(WETH, address(wethStrategy), amount);
+        vm.prank(address(wethStrategy));
+        IPool(aavePool).supply(WETH, amount, address(wethStrategy), 0);
+    }
 }
