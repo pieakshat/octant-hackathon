@@ -1,6 +1,6 @@
 ## Yield MM
 
-Yield MM is a market-making strategy designed for users who want both lending yield and swap fees without manually managing liquidity. The system is built on:
+Yield MM is a market-making + lending strategy vault designed for users who want both lending yield and swap fees without manually managing liquidity. The system is built on:
 
 - **Octant v2 multistrategy vaults** (one vault per asset),
 - **Aave** for base yield, and
@@ -44,8 +44,8 @@ Yield MM lets any depositor act like a professional market maker: capital earns 
   - `routers/ExactOutputSwapRouter.sol` – helper router used during withdrawals to source the paired asset with an exact-output swap.
   - `interfaces/IExactOutputSwapRouter.sol` – interface for the router above.
 - `test/`
-  - `fullTest.t.sol` – original integration tests covering deposits, swaps, and rebalancing behaviour.
-  - `EndToEnd.t.sol` – full mainnet-fork scenario that deposits users, runs a solver swap, and redeems shares through the entire pipeline.
+  - `fullTest.t.sol` – integration tests covering deposits, swaps, and rebalancing behaviour.
+  - `EndToEnd.t.sol` – full mainnet-fork scenario that deposits users, runs a trader swap, and redeems shares through the entire pipeline.
 - `foundry.toml` – Foundry configuration.
 
 ## Contracts Topology

@@ -238,23 +238,40 @@ contract YieldMMEndToEndTest is Test, Deployers {
         wethVault.deposit(seedWeth, wethDepositor);
         vm.stopPrank();
 
+        // manually seed strategy liquidity for testing purposes
+        // autoallocation is turned off 
+        deal(WETH, address(wethStrategy), seedWeth);
+        vm.prank(address(wethStrategy));
+        IERC20(WETH).forceApprove(address(aavePool), seedWeth);
+        vm.prank(address(wethStrategy));
+        IPool(aavePool).supply(WETH, seedWeth, address(wethStrategy), 0);
+
         uint256 swapAmount = 2_000 * 1e6;
         uint256 hookFee = (swapAmount * 50) / 10_000;
         uint256 expectedDeposit = swapAmount - hookFee;
 
-        address solver = makeAddr("end-to-end-solver");
-        uint256 solverWethBefore = IERC20(WETH).balanceOf(solver);
+        address trader = makeAddr("end-to-end-trader");
+        uint256 traderWethBefore = IERC20(WETH).balanceOf(trader);
         uint256 usdcStrategyBefore = usdcStrategy.totalManagedAssets();
         uint256 wethStrategyBefore = wethStrategy.totalManagedAssets();
 
-        _performUsdcToWethSwap(solver, swapAmount);
+        deal(USDC, trader, swapAmount);
+        vm.startPrank(trader);
+        IERC20(USDC).forceApprove(address(swapRouterNoChecks), swapAmount);
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: -int256(swapAmount),
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        swapRouterNoChecks.swap(key, params);
+        vm.stopPrank();
 
-        uint256 solverWethAfter = IERC20(WETH).balanceOf(solver);
+        uint256 traderWethAfter = IERC20(WETH).balanceOf(trader);
         uint256 usdcStrategyAfter = usdcStrategy.totalManagedAssets();
         uint256 wethStrategyAfter = wethStrategy.totalManagedAssets();
         uint256 governanceAfter = IERC20(USDC).balanceOf(hook.GOVERNANCE());
 
-        assertGt(solverWethAfter, solverWethBefore, "solver should receive WETH");
+        assertGt(traderWethAfter, traderWethBefore, "trader should receive WETH");
         assertApproxEqAbs(
             usdcStrategyAfter,
             usdcStrategyBefore + expectedDeposit,
@@ -300,23 +317,5 @@ contract YieldMMEndToEndTest is Test, Deployers {
         );
     }
 
-    function _performUsdcToWethSwap(address swapper, uint256 amountIn) internal {
-        deal(USDC, swapper, amountIn);
-        vm.startPrank(swapper);
-        IERC20(USDC).forceApprove(address(swapRouterNoChecks), amountIn);
-        SwapParams memory params = SwapParams({
-            zeroForOne: true,
-            amountSpecified: -int256(amountIn),
-            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-        });
-        swapRouterNoChecks.swap(key, params);
-        vm.stopPrank();
-    }
-
-    function _provideWethForPairStrategy(uint256 amount) internal {
-        deal(WETH, address(wethStrategy), amount);
-        vm.prank(address(wethStrategy));
-        IPool(aavePool).supply(WETH, amount, address(wethStrategy), 0);
-    }
 }
 
