@@ -5,7 +5,7 @@ import {Test} from "forge-std/Test.sol";
 import {Deployers} from "@uniswap/v4-core/test/utils/Deployers.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
-import {ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
@@ -74,6 +74,7 @@ contract TestCoWHook is Test, Deployers {
         _initializeAave();
         _deployVaultsAndStrategies();
         _configureHookRouting();
+        _provideBaseLiquidity();
         _seedStrategies();
     }
 
@@ -90,7 +91,7 @@ contract TestCoWHook is Test, Deployers {
     }
 
     function _deployHookAndPool() internal {
-        uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG);
+        uint160 flags = uint160(Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_FLAG);
         address hookAddress = address(flags);
         deployCodeTo("src/CoWHook/CoWHook.sol:CoWHook", abi.encode(manager), hookAddress);
         hook = CoWHook(hookAddress);
@@ -198,38 +199,14 @@ contract TestCoWHook is Test, Deployers {
     }
 
     function _provideBaseLiquidity() internal {
-        modifyLiquidityRouter.modifyLiquidity(
-            key,
-            ModifyLiquidityParams({
-                tickLower: -60,
-                tickUpper: 60,
-                liquidityDelta: 10 ether,
-                salt: bytes32(0)
-            }),
-            ZERO_BYTES
-        );
+        ModifyLiquidityParams memory params = ModifyLiquidityParams({
+            tickLower: -120,
+            tickUpper: 120,
+            liquidityDelta: 1e12,
+            salt: bytes32(0)
+        });
 
-        modifyLiquidityRouter.modifyLiquidity(
-            key,
-            ModifyLiquidityParams({
-                tickLower: -120,
-                tickUpper: 120,
-                liquidityDelta: 10 ether,
-                salt: bytes32(0)
-            }),
-            ZERO_BYTES
-        );
-
-        modifyLiquidityRouter.modifyLiquidity(
-            key,
-            ModifyLiquidityParams({
-                tickLower: TickMath.minUsableTick(60),
-                tickUpper: TickMath.maxUsableTick(60),
-                liquidityDelta: 10 ether,
-                salt: bytes32(0)
-            }),
-            ZERO_BYTES
-        );
+        modifyLiquidityRouter.modifyLiquidity(key, params, ZERO_BYTES);
     }
 
     function _seedStrategies() internal {
@@ -270,7 +247,100 @@ contract TestCoWHook is Test, Deployers {
         assertEq(wethVault.balanceOf(user), expectedWethShares, "WETH shares mismatch");
     }
 
-    function testSwapOnCowHook() public {
+    function testSwapExactInputUsdcForWethThroughHook() public {
+        address user = makeAddr("swap-user");
+        uint256 amountIn = 100 * 1e6;
 
+        deal(USDC, user, amountIn);
+
+        uint256 wethBalanceBefore = IERC20(WETH).balanceOf(user);
+
+        vm.startPrank(user);
+        IERC20(USDC).forceApprove(address(swapRouterNoChecks), amountIn);
+
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: -int256(amountIn),
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+
+        swapRouterNoChecks.swap(key, params);
+
+        vm.stopPrank();
+
+        uint256 wethBalanceAfter = IERC20(WETH).balanceOf(user);
+
+        assertGt(wethBalanceAfter, wethBalanceBefore, "User should receive WETH");
+        assertEq(IERC20(USDC).balanceOf(user), 0, "USDC should be spent");
+    }
+
+    function testLargeSwapThroughHook() public {
+        address strategyOperator = makeAddr("strategy-operator");
+        uint256 initialVaultUsdc = 5_000_000 * 1e6;
+        uint256 initialVaultWeth = 3_000 * 1e18;
+
+        deal(USDC, strategyOperator, initialVaultUsdc);
+        deal(WETH, strategyOperator, initialVaultWeth);
+
+        vm.startPrank(strategyOperator);
+        IERC20(USDC).forceApprove(address(usdcVault), initialVaultUsdc);
+        IERC20(WETH).forceApprove(address(wethVault), initialVaultWeth);
+        usdcVault.deposit(initialVaultUsdc, strategyOperator);
+        wethVault.deposit(initialVaultWeth, strategyOperator);
+        vm.stopPrank();
+
+        uint256 wethBuffer = 50 * 1e18;
+        deal(WETH, address(wethStrategy), wethBuffer);
+        vm.startPrank(address(wethStrategy));
+        IPool(aavePool).supply(WETH, wethBuffer, address(wethStrategy), 0);
+        vm.stopPrank();
+
+        address user = makeAddr("large-swapper");
+        uint256 amountIn = 2000 * 1e6;
+
+
+        deal(USDC, user, amountIn);
+        vm.startPrank(user);
+        IERC20(USDC).forceApprove(address(swapRouterNoChecks), amountIn);
+        // IERC20(USDC).transfer(address(swapRouterNoChecks), scaledAmountIn);
+        vm.stopPrank();
+
+        uint256 usdcStrategyAssetsBefore = usdcStrategy.totalManagedAssets();
+        uint256 wethStrategyAssetsBefore = wethStrategy.totalManagedAssets();
+        uint256 governanceUsdcBefore = IERC20(USDC).balanceOf(hook.GOVERNANCE());
+        uint256 userWethBefore = IERC20(WETH).balanceOf(user);
+
+        vm.prank(address(swapRouterNoChecks));
+        IERC20(USDC).forceApprove(address(hook), type(uint256).max);
+
+        emit log_named_uint("amountIn", amountIn);
+
+        vm.startPrank(user);
+        // IERC20(USDC).transfer(address(swapRouterNoChecks), amountIn);
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: -int256(amountIn),
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+        swapRouterNoChecks.swap(key, params);
+        vm.stopPrank();
+
+        uint256 userWethAfter = IERC20(WETH).balanceOf(user);
+        uint256 usdcStrategyAssetsAfter = usdcStrategy.totalManagedAssets();
+        uint256 wethStrategyAssetsAfter = wethStrategy.totalManagedAssets();
+        uint256 governanceUsdcAfter = IERC20(USDC).balanceOf(hook.GOVERNANCE());
+
+        uint256 expectedFee = (amountIn * 50) / 10_000;
+        uint256 expectedDeposit = amountIn - expectedFee;
+
+        assertGt(userWethAfter, userWethBefore, "User should receive WETH from strategy liquidity");
+        assertApproxEqAbs(
+            usdcStrategyAssetsAfter,
+            usdcStrategyAssetsBefore + expectedDeposit,
+            expectedDeposit / 100,
+            "USDC strategy should receive deposit minus fee"
+        );
+        assertLt(wethStrategyAssetsAfter, wethStrategyAssetsBefore, "WETH strategy should have reduced assets");
+        assertEq(governanceUsdcAfter - governanceUsdcBefore, expectedFee, "Governance should collect swap fee");
     }
 }

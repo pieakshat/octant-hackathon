@@ -18,6 +18,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary, toBeforeSwapDelta} from "v4-core/types/BeforeSwapDelta.sol";
+import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {FullMath} from "v4-core/libraries/FullMath.sol";
 
 interface IAaveLiquidityStrategy {
@@ -45,20 +46,33 @@ contract CoWHook is BaseHook {
     using SafeCast for uint256;
     using SafeCast for int256;
 
+struct PendingSwap {
+    address strategyIn;
+    address currencyIn;
+    address currencyOut;
+    uint256 depositAmount;
+    uint256 feeAmount;
+    uint256 totalInputAmount;
+    uint256 amountOut;
+}
+
     error StrategyNotConfigured();
     error InvalidStrategyAddress();
     error StrategyAssetMismatch();
     error NotGovernance();
     error UnsupportedSwapDirection();
+    error SwapAmountTooLarge();
     error InsufficientStrategyLiquidity();
+    error PendingSwapExists();
 
-    uint256 public constant MIN_SWAP_SIZE = 100000 * 10**18; // 100000 tokens 
+    uint256 public constant MIN_SWAP_SIZE = 1000 * 10**6; // 1000 USDC
     uint256 private constant MAX_BPS = 10_000;
     uint256 private constant HOOK_FEE_BPS = 50; // 0.5%
 
     address public immutable GOVERNANCE;
 
     mapping(address => IAaveLiquidityStrategy) public strategies;
+    mapping(bytes32 => PendingSwap) private pendingSwaps;
 
     event StrategyConfigured(address indexed token, address indexed strategy);
     event FeeCollected(address indexed token, uint256 amount);
@@ -120,7 +134,7 @@ contract CoWHook is BaseHook {
                 afterAddLiquidity: false,
                 afterRemoveLiquidity: false,
                 beforeSwap: true,
-                afterSwap: false,
+                afterSwap: true,
                 beforeDonate: false,
                 afterDonate: false,
                 beforeSwapReturnDelta: true,  
@@ -158,13 +172,18 @@ contract CoWHook is BaseHook {
 
         // Check if swap is large enough to handle directly
         if (ctx.amountIn >= MIN_SWAP_SIZE) {
-            return executeDirectSwap(sender, ctx);
+            return executeDirectSwap(sender, key, params, ctx);
         }
 
         return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    function executeDirectSwap(address sender, DirectSwapContext memory ctx)
+    function executeDirectSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        DirectSwapContext memory ctx
+    )
         internal
         returns (bytes4, BeforeSwapDelta, uint24)
     {
@@ -187,28 +206,53 @@ contract CoWHook is BaseHook {
             revert InsufficientStrategyLiquidity();
         }
 
-        IERC20(ctx.currencyOut).safeTransfer(sender, ctx.amountOut);
-
         uint256 surplus = withdrawn - ctx.amountOut;
         if (surplus > 0) {
             _depositIntoStrategy(outStrategy, ctx.currencyOut, surplus);
         }
 
-        IERC20(ctx.currencyIn).safeTransferFrom(sender, address(this), ctx.amountIn);
-
         uint256 fee = _calculateFee(ctx.amountIn);
         uint256 depositAmount = ctx.amountIn - fee;
 
-        if (depositAmount > 0) {
-            _depositIntoStrategy(inStrategy, ctx.currencyIn, depositAmount);
-        }
+        if (ctx.amountIn > 0) {
+            bytes32 swapKey = _computeSwapKey(sender, key, params);
 
-        if (fee > 0) {
-            IERC20(ctx.currencyIn).safeTransfer(GOVERNANCE, fee); // Fee goes to the governance contracts
-            emit FeeCollected(ctx.currencyIn, fee);
+            if (pendingSwaps[swapKey].currencyIn != address(0)) {
+                revert PendingSwapExists();
+            }
+
+            pendingSwaps[swapKey] = PendingSwap({
+                strategyIn: address(inStrategy),
+                currencyIn: ctx.currencyIn,
+                currencyOut: ctx.currencyOut,
+                depositAmount: depositAmount,
+                feeAmount: fee,
+                totalInputAmount: ctx.amountIn,
+                amountOut: ctx.amountOut
+            });
         }
 
         return _buildDelta(ctx);
+    }
+
+    function _computeSwapKey(address sender, PoolKey calldata key, SwapParams calldata params)
+        internal
+        pure
+        returns (bytes32)
+    {
+        return keccak256(
+            abi.encode(
+                sender,
+                key.currency0,
+                key.currency1,
+                key.fee,
+                key.tickSpacing,
+                key.hooks,
+                params.zeroForOne,
+                params.amountSpecified,
+                params.sqrtPriceLimitX96
+            )
+        );
     }
 
     function _depositIntoStrategy(IAaveLiquidityStrategy strategyRef, address token, uint256 amount) internal {
@@ -229,16 +273,16 @@ contract CoWHook is BaseHook {
         pure
         returns (bytes4, BeforeSwapDelta, uint24)
     {
-        int128 deltaSpecified;
-        int128 deltaUnspecified;
-
-        if (ctx.isExactInput) {
-            deltaSpecified = -(ctx.amountIn.toInt256().toInt128());
-            deltaUnspecified = ctx.amountOut.toInt256().toInt128();
-        } else {
-            deltaSpecified = ctx.amountOut.toInt256().toInt128();
-            deltaUnspecified = -(ctx.amountIn.toInt256().toInt128());
+        if (!ctx.isExactInput) {
+            revert UnsupportedSwapDirection();
         }
+
+        if (ctx.amountIn > uint256(type(uint256).max) || ctx.amountOut > uint256(type(uint256).max)) {
+            revert SwapAmountTooLarge();
+        }
+
+        int128 deltaSpecified = int256(ctx.amountIn).toInt128();
+        int128 deltaUnspecified = -int256(ctx.amountOut).toInt128();
 
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(deltaSpecified, deltaUnspecified), 0);
     }
@@ -280,4 +324,44 @@ contract CoWHook is BaseHook {
         }
     }
 
+    function _afterSwap(
+        address sender,
+        PoolKey calldata key,
+        SwapParams calldata params,
+        BalanceDelta,
+        bytes calldata
+    ) internal override returns (bytes4, int128) {
+        bytes32 swapKey = _computeSwapKey(sender, key, params);
+        PendingSwap memory pending = pendingSwaps[swapKey];
+
+        if (pending.currencyIn == address(0)) {
+            return (IHooks.afterSwap.selector, 0);
+        }
+
+        delete pendingSwaps[swapKey];
+
+        uint256 totalAmount = pending.totalInputAmount;
+        if (totalAmount > 0) {
+            poolManager.take(Currency.wrap(pending.currencyIn), address(this), totalAmount);
+
+            if (pending.depositAmount > 0) {
+                IERC20(pending.currencyIn).safeTransfer(pending.strategyIn, pending.depositAmount);
+                IAaveLiquidityStrategy(pending.strategyIn).pushAfterSwap(pending.depositAmount);
+            }
+
+            if (pending.feeAmount > 0) {
+                IERC20(pending.currencyIn).safeTransfer(GOVERNANCE, pending.feeAmount);
+                emit FeeCollected(pending.currencyIn, pending.feeAmount);
+            }
+        }
+
+        if (pending.amountOut > 0) {
+            Currency outCurrency = Currency.wrap(pending.currencyOut);
+            poolManager.sync(outCurrency);
+            IERC20(pending.currencyOut).safeTransfer(address(poolManager), pending.amountOut);
+            poolManager.settle();
+        }
+
+        return (IHooks.afterSwap.selector, 0);
+    }
 }
