@@ -17,7 +17,7 @@ interface IPairedStrategyLiquidity {
     function pullFundsForUser(uint256 amountOut, uint256 maxAmountIn) external returns (uint256);
 }
 
-contract AaveWethStrategy is BaseHealthCheck {
+contract AaveStrategy is BaseHealthCheck {
     using SafeERC20 for IERC20;
 
     address public immutable UNDERLYING_ASSET;
