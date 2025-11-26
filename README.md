@@ -84,3 +84,21 @@ Yield MM lets any depositor act like a professional market maker: capital earns 
 
 
 
+User's router calls poolManager.swap()
+Pool Manager calls hook.beforeSwap()
+Hook returns BeforeSwapDelta:
+deltaSpecified = +amountIn (in exact input) tells the pool not to swap input tokens
+deltaUnspecified = -amountOut indicates the user should receive amountOut
+Pool Manager modifies amountToSwap:
+amountToSwap += deltaSpecified → becomes 0, so no pool swap
+Pool Manager accounts a BalanceDelta to the user (they should receive amountOut)
+Pool Manager calls hook.afterSwap()
+Hook transfers output tokens to Pool Manager:
+poolManager.sync() + transfer() + poolManager.settle()
+User's router calls poolManager.take() to receive the tokens
+User's router calls poolManager.settle() to pay input tokens
+Why this works
+BeforeSwapDelta sets accounting: the user will receive amountOut.
+Hook supplies tokens: _afterSwap transfers tokens to Pool Manager.
+Router collects: poolManager.take() transfers tokens to the user.
+The hook effectively pre-executes the swap and ensures tokens are available when the router calls take().
