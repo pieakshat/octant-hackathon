@@ -1,5 +1,7 @@
 ## Yield MM
 
+Yield MM lets LPs park their assets in a yield-bearing vault backed by Aave. When a qualifying OTC order arrives, the hook temporarily withdraws the required liquidity from Aave, settles the trade, and redeploys the resulting assets back into Aave within the same transaction.
+
 Yield MM is a market-making + lending strategy vault designed for users who want both lending yield and swap fees without manually managing liquidity. The system is built on:
 
 - **Octant v2 multistrategy vaults** (one vault per asset),
